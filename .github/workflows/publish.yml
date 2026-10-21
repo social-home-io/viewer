@@ -21,10 +21,22 @@ name: Publish the pinned viewer
 # dependencies with a read-only token it doesn't keep, ``publish`` only
 # downloads the built files, checks them against the release's manifest and
 # runs git. Third-party actions are pinned by commit SHA.
+#
+# When: hourly, so a GFS running a fresh release never sends a visitor to a
+# ``v/<hash>/`` that isn't here yet for longer than about an hour (it was
+# daily). An hourly run whose version is already on ``gh-pages`` stops after
+# two API calls: no checkout, no install, no build. A
+# ``repository_dispatch`` of type ``socialhome-release`` (payload
+# ``{"ref": "<tag>"}``) publishes at once; nothing sends one yet, since it
+# needs a token with access to this repo in Social Home's release workflow,
+# which the org has not created. It is only a shortcut: the payload is
+# validated like a manual ref, and the build is still checked against
+# Social Home's own manifest.
 on:
   schedule:
-    # Daily: pick up a new Social Home release.
-    - cron: "17 4 * * *"
+    - cron: "17 * * * *"
+  repository_dispatch:
+    types: [socialhome-release]
   workflow_dispatch:
     inputs:
       ref:
@@ -55,7 +67,10 @@ jobs:
       - id: pick
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_REF: ${{ inputs.ref }}
+          # A manual run's input, or a dispatch's payload; empty on schedule.
+          INPUT_REF: ${{ inputs.ref || github.event.client_payload.ref }}
+          EVENT: ${{ github.event_name }}
+          SELF: ${{ github.repository }}
           REPO: social-home-io/socialhome
         run: |
           set -euo pipefail
@@ -75,11 +90,22 @@ jobs:
             echo "$ref ($sha) is not on social-home-io/socialhome main" >&2
             exit 1
           fi
-          if gh api "repos/$REPO/contents/socialhome/pinned_viewer.json?ref=$sha" >/dev/null 2>&1; then
+          if manifest="$(gh api -H "Accept: application/vnd.github.raw" \
+              "repos/$REPO/contents/socialhome/pinned_viewer.json?ref=$sha" 2>/dev/null)"; then
             has_viewer=true
           else
             has_viewer=false
             echo "$ref has no pinned viewer yet; nothing to publish."
+          fi
+          # Already published: an hourly (or dispatched) run stops here. A
+          # manual run always rebuilds, which re-checks the published bytes.
+          if [[ "$has_viewer" == true && "$EVENT" != "workflow_dispatch" ]]; then
+            path="$(jq -r .path <<<"$manifest")"
+            if [[ "$path" =~ ^v/[0-9a-f]{16}/$ ]] && \
+                gh api "repos/$SELF/contents/${path}viewer.js?ref=gh-pages" >/dev/null 2>&1; then
+              has_viewer=false
+              echo "$ref's viewer $path is already published."
+            fi
           fi
           {
             echo "sha=$sha"
