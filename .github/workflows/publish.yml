@@ -1,0 +1,204 @@
+name: Publish the pinned viewer
+
+# Builds the PINNED share-link viewer (public highlights and moments, see
+# social-home-io/socialhome docs/protocol/highlights_public.md, "Pinned
+# viewer") from a Social Home release and adds it to this repo's
+# ``gh-pages`` branch, served by GitHub Pages on https://viewer.social-home.io.
+#
+# Nothing pushes into this repo from outside: this workflow checks out the
+# Social Home release itself, rebuilds the viewer and publishes only a build
+# that is byte-identical to the version the release links to
+# (``socialhome/pinned_viewer.json`` in that release: ``path`` = v/<hash>/,
+# ``integrity`` = sha384 of viewer.js). So every published version is built
+# twice — once by Social Home's CI, once here — and the two must agree.
+#
+# Versions are content-addressed and only ever ADDED: an existing
+# ``v/<hash>/`` must match the rebuild byte for byte or the run fails, so
+# links minted by every earlier release keep opening.
+#
+# Three jobs, so no dependency code runs next to a write token:
+# ``resolve`` picks the Social Home ref, ``build`` installs the npm
+# dependencies with a read-only token it doesn't keep, ``publish`` only
+# downloads the built files, checks them against the release's manifest and
+# runs git. Third-party actions are pinned by commit SHA.
+on:
+  schedule:
+    # Daily: pick up a new Social Home release.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Social Home ref to build: a release tag, or a commit on main
+          (empty = the latest published release)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: viewer-gh-pages
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Pick the Social Home version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      ref: ${{ steps.pick.outputs.ref }}
+      has_viewer: ${{ steps.pick.outputs.has_viewer }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+          REPO: social-home-io/socialhome
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-}"
+          if [[ -z "$ref" ]]; then
+            ref="$(gh api "repos/$REPO/releases/latest" --jq .tag_name)"
+          fi
+          if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]{1,100}$ ]]; then
+            echo "unexpected ref: $ref" >&2
+            exit 1
+          fi
+          sha="$(gh api "repos/$REPO/commits/$ref" --jq .sha)"
+          # Only build what Social Home itself shipped or merged: a commit
+          # must be on main (a release tag always is).
+          status="$(gh api "repos/$REPO/compare/$sha...main" --jq .status)"
+          if [[ "$status" != "ahead" && "$status" != "identical" ]]; then
+            echo "$ref ($sha) is not on social-home-io/socialhome main" >&2
+            exit 1
+          fi
+          if gh api "repos/$REPO/contents/socialhome/pinned_viewer.json?ref=$sha" >/dev/null 2>&1; then
+            has_viewer=true
+          else
+            has_viewer=false
+            echo "$ref has no pinned viewer yet; nothing to publish."
+          fi
+          {
+            echo "sha=$sha"
+            echo "ref=$ref"
+            echo "has_viewer=$has_viewer"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build the pinned viewer
+    needs: resolve
+    if: needs.resolve.outputs.has_viewer == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: social-home-io/socialhome
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      # Same pnpm / Node as Social Home's CI ``frontend`` job, so the bytes
+      # match the manifest that CI checked.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10
+      - name: Install
+        working-directory: client
+        run: pnpm install --frozen-lockfile
+      - name: Build the pinned viewer
+        working-directory: client
+        run: pnpm run build:pinned-viewer
+      - name: The rebuild is the version this release links to
+        run: git diff --exit-code -- socialhome/pinned_viewer.json
+      - name: Stage this version
+        run: |
+          set -euo pipefail
+          path="$(node -p "require('./socialhome/pinned_viewer.json').path")"
+          if [[ ! "$path" =~ ^v/[0-9a-f]{16}/$ ]]; then
+            echo "unexpected manifest path: $path" >&2
+            exit 1
+          fi
+          mkdir -p staged
+          cp "client/dist-pinned/$path/index.html" "client/dist-pinned/$path/viewer.js" staged/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pinned-viewer
+          path: staged/
+          if-no-files-found: error
+
+  publish:
+    name: Add this version to gh-pages
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # Push to this repo's ``gh-pages`` with the default GITHUB_TOKEN;
+      # nothing else, and no dependency code runs in this job.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: pinned-viewer
+          path: staged
+      - name: Check the build against the release's own manifest
+        # Read the manifest straight from Social Home (not from the build
+        # job), so a tampered build job can't vouch for itself.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/social-home-io/socialhome/contents/socialhome/pinned_viewer.json?ref=$SHA" \
+            > manifest.json
+          path="$(jq -r .path manifest.json)"
+          want="$(jq -r .integrity manifest.json)"
+          if [[ ! "$path" =~ ^v/[0-9a-f]{16}/$ ]]; then
+            echo "unexpected manifest path: $path" >&2
+            exit 1
+          fi
+          got="sha384-$(openssl dgst -sha384 -binary staged/viewer.js | base64 -w0)"
+          if [[ "$got" != "$want" ]]; then
+            echo "viewer.js is $got, the release expects $want" >&2
+            exit 1
+          fi
+          printf '%s' "$path" > staged/PATH
+      - name: Add this version to gh-pages
+        env:
+          REF_NAME: ${{ needs.resolve.outputs.ref }}
+        run: |
+          set -euo pipefail
+          path="$(cat staged/PATH)"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --no-tags --depth=1 origin +gh-pages:refs/remotes/origin/gh-pages
+            git worktree add -B gh-pages pages origin/gh-pages
+          else
+            git worktree add --orphan -b gh-pages pages
+          fi
+          if [[ -e "pages/$path" ]]; then
+            # Content-addressed: an existing version never changes.
+            cmp staged/index.html "pages/$path/index.html"
+            cmp staged/viewer.js "pages/$path/viewer.js"
+          else
+            mkdir -p "pages/$path"
+            cp staged/index.html staged/viewer.js "pages/$path"
+          fi
+          # Serve the files as they are (no Jekyll), on the viewer's origin.
+          touch pages/.nojekyll
+          printf 'viewer.social-home.io\n' > pages/CNAME
+          cd pages
+          git add .nojekyll CNAME "$path"
+          if git diff --cached --quiet; then
+            echo "gh-pages already has $path"
+            exit 0
+          fi
+          git commit -m "Pinned viewer $path (Social Home $REF_NAME)"
+          git push origin gh-pages
